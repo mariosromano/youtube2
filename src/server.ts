@@ -3,7 +3,6 @@ import express from 'express';
 import cors from 'cors';
 import path from 'path';
 import Anthropic from '@anthropic-ai/sdk';
-import { YoutubeTranscript } from 'youtube-transcript';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -33,6 +32,66 @@ function getVideoId(url) {
   return null;
 }
 
+// Fetch transcript directly from YouTube's timedtext API
+async function fetchTranscript(videoId) {
+  try {
+    // First, get the video page to find caption tracks
+    const watchUrl = `https://www.youtube.com/watch?v=${videoId}`;
+    const response = await fetch(watchUrl, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept-Language': 'en-US,en;q=0.9',
+      }
+    });
+    
+    const html = await response.text();
+    
+    // Find captions URL in the page
+    const captionMatch = html.match(/"captionTracks":\s*(\[.*?\])/);
+    if (!captionMatch) {
+      throw new Error('No captions found');
+    }
+    
+    const captionTracks = JSON.parse(captionMatch[1]);
+    if (!captionTracks || captionTracks.length === 0) {
+      throw new Error('No caption tracks available');
+    }
+    
+    // Prefer English, fall back to first available
+    let captionUrl = captionTracks[0].baseUrl;
+    for (const track of captionTracks) {
+      if (track.languageCode === 'en' || track.vssId?.includes('en')) {
+        captionUrl = track.baseUrl;
+        break;
+      }
+    }
+    
+    // Fetch the captions
+    const captionResponse = await fetch(captionUrl);
+    const captionXml = await captionResponse.text();
+    
+    // Parse XML to extract text
+    const textMatches = captionXml.matchAll(/<text[^>]*>(.*?)<\/text>/gs);
+    const texts = [];
+    for (const match of textMatches) {
+      // Decode HTML entities
+      let text = match[1]
+        .replace(/&amp;/g, '&')
+        .replace(/&lt;/g, '<')
+        .replace(/&gt;/g, '>')
+        .replace(/&quot;/g, '"')
+        .replace(/&#39;/g, "'")
+        .replace(/\n/g, ' ');
+      texts.push(text);
+    }
+    
+    return texts.join(' ');
+  } catch (error) {
+    console.error('Transcript fetch error:', error);
+    throw error;
+  }
+}
+
 // Main analyze endpoint
 app.post('/api/analyze', async (req, res) => {
   try {
@@ -58,13 +117,18 @@ app.post('/api/analyze', async (req, res) => {
     // Get transcript
     let transcript;
     try {
-      const transcriptData = await YoutubeTranscript.fetchTranscript(videoId);
-      transcript = transcriptData.map(item => item.text).join(' ');
+      transcript = await fetchTranscript(videoId);
+      if (!transcript || transcript.trim().length === 0) {
+        throw new Error('Empty transcript');
+      }
     } catch (err) {
+      console.error('Transcript error:', err.message);
       return res.status(400).json({ 
-        error: 'Could not get transcript. Make sure the video has captions enabled.' 
+        error: 'Could not get transcript. The video may not have captions, or they may be disabled.' 
       });
     }
+
+    console.log(`Transcript length: ${transcript.length} characters`);
 
     // Truncate if too long
     const maxChars = 100000;
